@@ -986,6 +986,27 @@ fn prefetch_concurrency_cap(s3_concurrency: u32) -> usize {
     (total - reserve).max(1)
 }
 
+fn key_cache_absence_is_authoritative(refresh_secs: u64, age: Option<Duration>) -> bool {
+    let authoritative_for =
+        Duration::from_secs(refresh_secs.saturating_mul(KEY_CACHE_AUTHORITATIVE_MULTIPLIER));
+    refresh_secs > 0 && matches!(age, Some(age) if age <= authoritative_for)
+}
+
+fn speculative_prefetch_disabled(prefetch_enabled: bool) -> bool {
+    !prefetch_enabled
+}
+
+fn should_start_speculative_prefetch_tasks(
+    remote_configured: bool,
+    prefetch_enabled: bool,
+) -> bool {
+    remote_configured && prefetch_enabled
+}
+
+fn remote_key_cache_refresh_disabled(refresh_secs: u64) -> bool {
+    refresh_secs == 0
+}
+
 /// Daemon-lifetime prefetch/planning observability counters (#485 Phase 0).
 ///
 /// Telemetry only — nothing here feeds a decision. Adaptive cancellation is
@@ -2201,16 +2222,10 @@ impl Daemon {
         // Check key cache first (no semaphore needed for in-memory lookup)
         match self.key_cache.check(&req.key).await {
             Some(false) => {
-                let authoritative_for = Duration::from_secs(
-                    self.config
-                        .remote_key_cache_refresh_secs
-                        .saturating_mul(KEY_CACHE_AUTHORITATIVE_MULTIPLIER),
+                let authoritative = key_cache_absence_is_authoritative(
+                    self.config.remote_key_cache_refresh_secs,
+                    self.key_cache.age().await,
                 );
-                let authoritative = self.config.remote_key_cache_refresh_secs > 0
-                    && matches!(
-                        self.key_cache.age().await,
-                        Some(age) if age <= authoritative_for
-                    );
                 if authoritative {
                     tracing::debug!("key cache: {} not found (skipping remote)", &req.key);
                     return Response::found(false);
@@ -2557,7 +2572,7 @@ impl Daemon {
     /// Handle a prefetch request: fire-and-forget background downloads.
     /// Spawns a single coordinator task that processes keys with bounded concurrency.
     pub async fn handle_prefetch(self: &Arc<Self>, req: &PrefetchRequest) -> Response {
-        if !self.config.prefetch_enabled {
+        if speculative_prefetch_disabled(self.config.prefetch_enabled) {
             tracing::debug!("prefetch request ignored: speculative prefetch disabled");
             return Response::ok();
         }
@@ -3054,7 +3069,7 @@ impl Daemon {
         let Some(_remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
-        if !self.config.prefetch_enabled {
+        if speculative_prefetch_disabled(self.config.prefetch_enabled) {
             tracing::debug!("build-started: speculative prefetch disabled");
             return Response::ok();
         }
@@ -3550,7 +3565,10 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     // The remote key cache only serves speculative planning. Exact-key remote
     // checks and uploads do not depend on it, so disabling prefetch also avoids
     // the expensive whole-remote LIST entirely.
-    let cache_handle = if config.remote.is_some() && config.prefetch_enabled {
+    let cache_handle = if should_start_speculative_prefetch_tasks(
+        config.remote.is_some(),
+        config.prefetch_enabled,
+    ) {
         let cache_daemon = daemon.clone();
         let refresh_secs = config.remote_key_cache_refresh_secs;
         Some(tokio::spawn(async move {
@@ -3574,7 +3592,7 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
                 }
             }
 
-            if refresh_secs == 0 {
+            if remote_key_cache_refresh_disabled(refresh_secs) {
                 tracing::info!("remote key cache periodic refresh disabled");
                 return;
             }
@@ -3618,7 +3636,10 @@ async fn server_main(config: &Config, coord: DaemonCoordFile) -> Result<()> {
     // Manifest auto-prefetch: download manifest from S3 and prefetch expensive crates.
     // Runs once on startup — subsequent builds update the manifest via `kache save-manifest`.
     // On completion, signals the warming barrier so handle_remote_check can proceed.
-    let manifest_handle = if config.remote.is_some() && config.prefetch_enabled {
+    let manifest_handle = if should_start_speculative_prefetch_tasks(
+        config.remote.is_some(),
+        config.prefetch_enabled,
+    ) {
         let manifest_daemon = daemon.clone();
         Some(tokio::spawn(async move {
             manifest_prefetch(&manifest_daemon).await;
@@ -5468,6 +5489,36 @@ mod tests {
     /// The rework counts EVERY distinct demanded key; these pin the decision
     /// function's semantics.
     #[test]
+    fn key_cache_authority_respects_refresh_policy_and_age_boundary() {
+        assert!(!key_cache_absence_is_authoritative(0, Some(Duration::ZERO)));
+        assert!(!key_cache_absence_is_authoritative(60, None));
+        assert!(key_cache_absence_is_authoritative(60, Some(Duration::ZERO)));
+        assert!(key_cache_absence_is_authoritative(
+            60,
+            Some(Duration::from_secs(300))
+        ));
+        assert!(!key_cache_absence_is_authoritative(
+            60,
+            Some(Duration::from_secs(301))
+        ));
+    }
+
+    #[test]
+    fn speculative_prefetch_policy_distinguishes_every_boolean_combination() {
+        assert!(speculative_prefetch_disabled(false));
+        assert!(!speculative_prefetch_disabled(true));
+
+        assert!(!should_start_speculative_prefetch_tasks(false, false));
+        assert!(!should_start_speculative_prefetch_tasks(false, true));
+        assert!(!should_start_speculative_prefetch_tasks(true, false));
+        assert!(should_start_speculative_prefetch_tasks(true, true));
+
+        assert!(remote_key_cache_refresh_disabled(0));
+        assert!(!remote_key_cache_refresh_disabled(1));
+        assert!(!remote_key_cache_refresh_disabled(60));
+    }
+
+    #[test]
     fn should_cancel_prefetch_fires_on_low_candidate_share() {
         // 12 distinct demands, only 1 was a plan candidate, nothing else
         // downloaded — a plainly bad plan.
@@ -5914,6 +5965,43 @@ mod tests {
         );
         let resp = client.await.expect("join client task");
         assert!(resp.ok, "stop request should return ok");
+    }
+
+    #[tokio::test]
+    async fn server_main_publishes_ready_and_handles_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.prefetch_enabled = false;
+        config.daemon_idle_timeout_secs = 0;
+        let socket_path = config.socket_path();
+        let coord = DaemonCoordFile::for_socket(&socket_path);
+        coord.write_phase(DaemonPhase::Starting).unwrap();
+
+        let server_config = config.clone();
+        let server_coord = coord.clone();
+        let server = tokio::spawn(async move { server_main(&server_config, server_coord).await });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if read_daemon_state(&socket_path)
+                    .is_some_and(|state| state.phase == DaemonPhase::Ready)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("server_main must publish ready state");
+
+        let response = client_roundtrip(&socket_path, &Request::Shutdown).await;
+        assert!(response.ok, "server_main must handle a shutdown request");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server_main must exit after shutdown")
+            .expect("server task must join");
+        assert!(result.is_ok(), "server_main returned {result:?}");
     }
 
     #[tokio::test]

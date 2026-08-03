@@ -2080,6 +2080,15 @@ remote_key_cache_refresh_secs = 900
             assert!(config.prefetch_enabled);
             assert_eq!(config.remote_key_cache_refresh_secs, 0);
         }
+
+        for disabled in ["0", "false", "FALSE"] {
+            let _enabled = NamedEnvGuard::set("KACHE_PREFETCH_ENABLED", disabled);
+            let config = Config::load().unwrap();
+            assert!(
+                !config.prefetch_enabled,
+                "{disabled:?} must disable speculative prefetch"
+            );
+        }
     }
 
     #[test]
