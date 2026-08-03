@@ -14,7 +14,7 @@ use crate::compiler::{
 use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
 use crate::link;
-use crate::store::{Store, StorePutResult};
+use crate::store::{BuildClaim, Store, StorePutResult};
 
 /// Check whether progress lines should be printed to stderr.
 ///
@@ -611,12 +611,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
             // Replay the cached compiler diagnostics so warnings still
             // surface on a cache hit.
-            if !meta.stdout.is_empty() {
-                print!("{}", meta.stdout);
-            }
-            if !meta.stderr.is_empty() {
-                eprint!("{}", meta.stderr);
-            }
+            replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
 
             return Ok(0);
         }
@@ -1227,13 +1222,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 0,
             );
             print_progress(crate_name, EventResult::LocalHit, elapsed, size);
-            // Print cached stdout/stderr
-            if !meta.stdout.is_empty() {
-                print!("{}", meta.stdout);
-            }
-            if !meta.stderr.is_empty() {
-                eprint!("{}", meta.stderr);
-            }
+            replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
             clean_incremental_dir(config, &args);
 
             return Ok(0);
@@ -1307,12 +1296,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         0,
                     );
                     print_progress(crate_name, event_result, elapsed, size);
-                    if !meta.stdout.is_empty() {
-                        print!("{}", meta.stdout);
-                    }
-                    if !meta.stderr.is_empty() {
-                        eprint!("{}", meta.stderr);
-                    }
+                    replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
                     clean_incremental_dir(config, &args);
                     return Ok(0);
                 }
@@ -1322,12 +1306,17 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         }
     }
 
-    // 3. Cache miss — try to acquire build lock
-    let lock = match store.try_lock(&cache_key) {
-        Ok(Some(lock)) => lock,
+    // 3. Cache miss — claim the key, then re-check under the build lock.
+    // A peer can exit without committing, so a completed wait is not itself a
+    // reason to bypass the cache. Re-claim until we either own the key or see
+    // the peer's committed entry.
+    let (lock, committed) = match claim_build_after_wait(&store, &cache_key, crate_name) {
+        Ok(BuildClaim::Acquired(lock)) => (Some(lock), None),
+        Ok(BuildClaim::Committed(meta)) => (None, Some(*meta)),
+        Ok(BuildClaim::Contended) => unreachable!("claim helper resolves contention"),
         Err(e) => {
             tracing::warn!(
-                "acquiring build lock for {} failed: {} — recompiling",
+                "claiming or waiting for build {} failed: {} — recompiling",
                 crate_name,
                 e
             );
@@ -1337,81 +1326,66 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 crate_name,
                 &event_root,
                 start,
-                format!("build lock unavailable: {e}"),
+                format!("build claim failed: {e}"),
             );
         }
-        Ok(None) => {
-            // Another process is building this key — wait for it
-            tracing::debug!("waiting for {} to be built by another process", crate_name);
-            if store.wait_for_committed(&cache_key).unwrap_or(false) {
-                // It's now available
-                if let Ok(Some(meta)) = store.get(&cache_key) {
-                    let restore_start = std::time::Instant::now();
-                    if let Err(e) = restore_from_cache(
-                        config,
-                        &compiler,
-                        &BlobSource::Store(&store),
-                        &args,
-                        &meta,
-                    ) {
-                        tracing::warn!(
-                            "restoring cache hit for {} failed: {} — recompiling",
-                            crate_name,
-                            e
-                        );
-                        return passthrough_with_event(
-                            config,
-                            &args,
-                            crate_name,
-                            &event_root,
-                            start,
-                            format!("restore failed: {e}"),
-                        );
-                    }
-                    let restore_ms = restore_start.elapsed().as_millis() as u64;
-                    let elapsed = start.elapsed().as_millis() as u64;
-                    let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                    log_event_with_hash_stats(
-                        config,
-                        &event_root,
-                        crate_name,
-                        EventResult::LocalHit,
-                        elapsed,
-                        meta.compile_time_ms,
-                        size,
-                        &cache_key,
-                        key_ms,
-                        key_hash_stats,
-                        lookup_ms,
-                        restore_ms,
-                        0,
-                    );
-                    // Replay the original compiler diagnostics, exactly as
-                    // the other hit sites do — otherwise the process that
-                    // loses the build-lock race silently swallows the
-                    // cached warnings/notes.
-                    if !meta.stdout.is_empty() {
-                        print!("{}", meta.stdout);
-                    }
-                    if !meta.stderr.is_empty() {
-                        eprint!("{}", meta.stderr);
-                    }
-                    clean_incremental_dir(config, &args);
-                    return Ok(0);
-                }
-            }
-            // If waiting failed, fall through to compile
-            tracing::warn!("wait for {} failed, compiling ourselves", crate_name);
-            // Compile without caching
+    };
+
+    if let Some(meta) = committed {
+        let restore_start = std::time::Instant::now();
+        if let Err(e) =
+            restore_from_cache(config, &compiler, &BlobSource::Store(&store), &args, &meta)
+        {
+            tracing::warn!(
+                "restoring cache hit for {} failed: {} — recompiling",
+                crate_name,
+                e
+            );
             return passthrough_with_event(
                 config,
                 &args,
                 crate_name,
                 &event_root,
                 start,
-                "build lock wait failed",
+                format!("restore failed: {e}"),
             );
         }
+        let restore_ms = restore_start.elapsed().as_millis() as u64;
+        let elapsed = start.elapsed().as_millis() as u64;
+        let size: u64 = meta.files.iter().map(|f| f.size).sum();
+        log_event_with_hash_stats(
+            config,
+            &event_root,
+            crate_name,
+            EventResult::LocalHit,
+            elapsed,
+            meta.compile_time_ms,
+            size,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            restore_ms,
+            0,
+        );
+        print_progress(crate_name, EventResult::LocalHit, elapsed, size);
+        // Replay the original compiler diagnostics, exactly as the other hit
+        // sites do, so a coalesced compile does not swallow warnings or notes.
+        replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+        clean_incremental_dir(config, &args);
+        return Ok(0);
+    }
+
+    let Some(lock) = lock else {
+        tracing::warn!("wait for {} failed, compiling ourselves", crate_name);
+        return passthrough_with_event(
+            config,
+            &args,
+            crate_name,
+            &event_root,
+            start,
+            "build lock wait failed",
+        );
     };
 
     // 4. Compile
@@ -1915,14 +1889,25 @@ fn try_daemon_local_hit(
         0,
     );
     print_progress(crate_name, EventResult::LocalHit, elapsed, size);
-    if !meta.stdout.is_empty() {
-        print!("{}", meta.stdout);
-    }
-    if !meta.stderr.is_empty() {
-        eprint!("{}", meta.stderr);
-    }
+    replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
     clean_incremental_dir(config, args);
     Some(0)
+}
+
+/// Claim a cache miss, waiting through peer ownership until the caller either
+/// owns the key or can consume a committed peer result. A peer that exits
+/// without committing is not a cache failure: retry the claim instead of
+/// bypassing Kache for the compilation.
+fn claim_build_after_wait(store: &Store, cache_key: &str, crate_name: &str) -> Result<BuildClaim> {
+    loop {
+        match store.claim_build(cache_key)? {
+            BuildClaim::Contended => {
+                tracing::debug!("waiting for {} to be built by another process", crate_name);
+                let _ = store.wait_for_committed(cache_key)?;
+            }
+            claim => return Ok(claim),
+        }
+    }
 }
 
 /// Where restore reads blobs from: an open store (classic path) or just the
@@ -1948,6 +1933,26 @@ impl BlobSource<'_> {
         if let BlobSource::Store(store) = self {
             let _ = store.remove_entry(cache_key);
         }
+    }
+}
+
+/// Replay cached compiler diagnostics to the given sinks, exactly as a fresh
+/// compile would emit them — so a cache hit, or a coalesced restore, never
+/// swallows the original warnings and notes. Empty streams write nothing.
+///
+/// Split out (and written to injectable sinks) so the "non-empty stream is
+/// replayed, empty stream is skipped" contract is unit-testable without
+/// capturing the process's real stdout/stderr.
+fn replay_cached_diagnostics(
+    meta: &crate::store::EntryMeta,
+    mut out: impl std::io::Write,
+    mut err: impl std::io::Write,
+) {
+    if !meta.stdout.is_empty() {
+        let _ = write!(out, "{}", meta.stdout);
+    }
+    if !meta.stderr.is_empty() {
+        let _ = write!(err, "{}", meta.stderr);
     }
 }
 
@@ -3406,6 +3411,69 @@ mod tests {
         }
     }
 
+    fn meta_with_diagnostics(stdout: &str, stderr: &str) -> crate::store::EntryMeta {
+        crate::store::EntryMeta {
+            cache_key: "k".to_string(),
+            crate_name: "c".to_string(),
+            crate_types: vec![],
+            files: vec![],
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            features: vec![],
+            target: String::new(),
+            profile: String::new(),
+            compile_time_ms: 0,
+            emit_kinds: vec![],
+        }
+    }
+
+    #[test]
+    fn replay_cached_diagnostics_writes_nonempty_and_skips_empty() {
+        // Non-empty streams are replayed verbatim, each to its own sink. This is
+        // the contract the coalesced-restore (and every cache-hit) path relies on
+        // to avoid swallowing the original compiler warnings/notes.
+        let m = meta_with_diagnostics("warning: unused\n", "error: boom\n");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        replay_cached_diagnostics(&m, &mut out, &mut err);
+        assert_eq!(out, b"warning: unused\n");
+        assert_eq!(err, b"error: boom\n");
+
+        // Empty streams write nothing — the `!is_empty()` guard is load-bearing:
+        // dropping it (as a mutant does) would make the non-empty case above emit
+        // nothing, which the assertions catch.
+        let empty = meta_with_diagnostics("", "");
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        replay_cached_diagnostics(&empty, &mut out2, &mut err2);
+        assert!(out2.is_empty(), "empty stdout must not be written");
+        assert!(err2.is_empty(), "empty stderr must not be written");
+    }
+
+    #[test]
+    fn claim_build_after_wait_reclaims_key_when_peer_exits_without_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let owner = Store::open(&config).unwrap();
+        let waiter = Store::open(&config).unwrap();
+        let cache_key = "peer_exited_without_commit";
+
+        let owner_lock = match owner.claim_build(cache_key).unwrap() {
+            BuildClaim::Acquired(lock) => lock,
+            BuildClaim::Committed(_) | BuildClaim::Contended => {
+                panic!("owner must acquire the initial build claim")
+            }
+        };
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(owner_lock);
+        });
+
+        let claim = claim_build_after_wait(&waiter, cache_key, "peer-exit-test").unwrap();
+        release.join().unwrap();
+        assert!(matches!(claim, BuildClaim::Acquired(_)));
+    }
+
     fn cached_file(name: &str, hash: &str) -> crate::store::CachedFile {
         crate::store::CachedFile {
             name: name.to_string(),
@@ -4533,6 +4601,58 @@ mod tests {
 
         assert!(!cache_dir.join(".build-session").exists());
         assert!(!cache_dir.join(".build-sessions").exists());
+    }
+
+    #[test]
+    fn maybe_trigger_prefetch_records_an_enabled_build_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"prefetch-positive\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n",
+        )
+        .unwrap();
+
+        let out_dir = workspace.join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let args = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--out-dir".to_string(),
+            out_dir.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let cache_dir = dir.path().join("cache");
+        let mut config = test_config(cache_dir);
+        config.remote = Some(crate::config::RemoteConfig::test_s3(
+            "test-bucket",
+            "kache/",
+        ));
+        config.prefetch_enabled = true;
+
+        let root = args
+            .workspace_root()
+            .expect("out-dir should identify the workspace")
+            .to_string_lossy()
+            .into_owned();
+        let marker = session_marker_path(&config, &root);
+        assert!(!marker.exists());
+
+        maybe_trigger_prefetch(&config, &args);
+
+        let content = std::fs::read_to_string(&marker)
+            .expect("enabled prefetch must record the build session");
+        let (timestamp, session_id) =
+            parse_session_marker(&content).expect("build-session marker must be valid");
+        assert!(timestamp > 0);
+        assert_eq!(session_id.len(), 16);
+        assert_eq!(current_session_id(&config, &root), session_id);
     }
 
     /// Incremental cleanup only removes a real directory when the config flag
