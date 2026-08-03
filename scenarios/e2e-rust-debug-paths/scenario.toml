@@ -39,6 +39,10 @@ path = "source"
 
 [env]
 RUSTC_WRAPPER = "$KACHE"
+# This fixture asserts DWARF contents, so override host-level Cargo profiles
+# that disable or strip dev debug info for faster local builds.
+CARGO_PROFILE_DEV_DEBUG = "2"
+CARGO_PROFILE_DEV_STRIP = "none"
 
 [commands]
 # DEBUG build (no --release) so DWARF is emitted and remapped.
