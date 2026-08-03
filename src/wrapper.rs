@@ -1323,12 +1323,16 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     }
 
     // 3. Cache miss — claim the key, then re-check under the build lock.
-    let (lock, committed) = match store.claim_build(&cache_key) {
+    // A peer can exit without committing, so a completed wait is not itself a
+    // reason to bypass the cache. Re-claim until we either own the key or see
+    // the peer's committed entry.
+    let (lock, committed) = match claim_build_after_wait(&store, &cache_key, crate_name) {
         Ok(BuildClaim::Acquired(lock)) => (Some(lock), None),
         Ok(BuildClaim::Committed(meta)) => (None, Some(*meta)),
+        Ok(BuildClaim::Contended) => unreachable!("claim helper resolves contention"),
         Err(e) => {
             tracing::warn!(
-                "claiming build for {} failed: {} — recompiling",
+                "claiming or waiting for build {} failed: {} — recompiling",
                 crate_name,
                 e
             );
@@ -1340,16 +1344,6 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 start,
                 format!("build claim failed: {e}"),
             );
-        }
-        Ok(BuildClaim::Contended) => {
-            // Another process is building this key — wait for it
-            tracing::debug!("waiting for {} to be built by another process", crate_name);
-            let committed = store
-                .wait_for_committed(&cache_key)
-                .unwrap_or(false)
-                .then(|| store.get(&cache_key).ok().flatten())
-                .flatten();
-            (None, committed)
         }
     };
 
@@ -1390,6 +1384,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             restore_ms,
             0,
         );
+        print_progress(crate_name, EventResult::LocalHit, elapsed, size);
         // Replay the original compiler diagnostics, exactly as the other hit
         // sites do, so a coalesced compile does not swallow warnings or notes.
         replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
@@ -1918,6 +1913,22 @@ fn try_daemon_local_hit(
     }
     clean_incremental_dir(config, args);
     Some(0)
+}
+
+/// Claim a cache miss, waiting through peer ownership until the caller either
+/// owns the key or can consume a committed peer result. A peer that exits
+/// without committing is not a cache failure: retry the claim instead of
+/// bypassing Kache for the compilation.
+fn claim_build_after_wait(store: &Store, cache_key: &str, crate_name: &str) -> Result<BuildClaim> {
+    loop {
+        match store.claim_build(cache_key)? {
+            BuildClaim::Contended => {
+                tracing::debug!("waiting for {} to be built by another process", crate_name);
+                let _ = store.wait_for_committed(cache_key)?;
+            }
+            claim => return Ok(claim),
+        }
+    }
 }
 
 /// Where restore reads blobs from: an open store (classic path) or just the
@@ -3458,6 +3469,30 @@ mod tests {
         replay_cached_diagnostics(&empty, &mut out2, &mut err2);
         assert!(out2.is_empty(), "empty stdout must not be written");
         assert!(err2.is_empty(), "empty stderr must not be written");
+    }
+
+    #[test]
+    fn claim_build_after_wait_reclaims_key_when_peer_exits_without_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let owner = Store::open(&config).unwrap();
+        let waiter = Store::open(&config).unwrap();
+        let cache_key = "peer_exited_without_commit";
+
+        let owner_lock = match owner.claim_build(cache_key).unwrap() {
+            BuildClaim::Acquired(lock) => lock,
+            BuildClaim::Committed(_) | BuildClaim::Contended => {
+                panic!("owner must acquire the initial build claim")
+            }
+        };
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(owner_lock);
+        });
+
+        let claim = claim_build_after_wait(&waiter, cache_key, "peer-exit-test").unwrap();
+        release.join().unwrap();
+        assert!(matches!(claim, BuildClaim::Acquired(_)));
     }
 
     fn cached_file(name: &str, hash: &str) -> crate::store::CachedFile {
