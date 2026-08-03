@@ -4589,6 +4589,58 @@ mod tests {
         assert!(!cache_dir.join(".build-sessions").exists());
     }
 
+    #[test]
+    fn maybe_trigger_prefetch_records_an_enabled_build_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"prefetch-positive\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }\n",
+        )
+        .unwrap();
+
+        let out_dir = workspace.join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let args = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--out-dir".to_string(),
+            out_dir.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let cache_dir = dir.path().join("cache");
+        let mut config = test_config(cache_dir);
+        config.remote = Some(crate::config::RemoteConfig::test_s3(
+            "test-bucket",
+            "kache/",
+        ));
+        config.prefetch_enabled = true;
+
+        let root = args
+            .workspace_root()
+            .expect("out-dir should identify the workspace")
+            .to_string_lossy()
+            .into_owned();
+        let marker = session_marker_path(&config, &root);
+        assert!(!marker.exists());
+
+        maybe_trigger_prefetch(&config, &args);
+
+        let content = std::fs::read_to_string(&marker)
+            .expect("enabled prefetch must record the build session");
+        let (timestamp, session_id) =
+            parse_session_marker(&content).expect("build-session marker must be valid");
+        assert!(timestamp > 0);
+        assert_eq!(session_id.len(), 16);
+        assert_eq!(current_session_id(&config, &root), session_id);
+    }
+
     /// Incremental cleanup only removes a real directory when the config flag
     /// is enabled; absent paths and disabled cleanup are silent no-ops.
     #[test]
