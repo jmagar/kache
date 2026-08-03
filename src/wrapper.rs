@@ -611,12 +611,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
             // Replay the cached compiler diagnostics so warnings still
             // surface on a cache hit.
-            if !meta.stdout.is_empty() {
-                print!("{}", meta.stdout);
-            }
-            if !meta.stderr.is_empty() {
-                eprint!("{}", meta.stderr);
-            }
+            replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
 
             return Ok(0);
         }
@@ -1227,13 +1222,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 0,
             );
             print_progress(crate_name, EventResult::LocalHit, elapsed, size);
-            // Print cached stdout/stderr
-            if !meta.stdout.is_empty() {
-                print!("{}", meta.stdout);
-            }
-            if !meta.stderr.is_empty() {
-                eprint!("{}", meta.stderr);
-            }
+            replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
             clean_incremental_dir(config, &args);
 
             return Ok(0);
@@ -1307,12 +1296,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                         0,
                     );
                     print_progress(crate_name, event_result, elapsed, size);
-                    if !meta.stdout.is_empty() {
-                        print!("{}", meta.stdout);
-                    }
-                    if !meta.stderr.is_empty() {
-                        eprint!("{}", meta.stderr);
-                    }
+                    replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
                     clean_incremental_dir(config, &args);
                     return Ok(0);
                 }
@@ -1905,12 +1889,7 @@ fn try_daemon_local_hit(
         0,
     );
     print_progress(crate_name, EventResult::LocalHit, elapsed, size);
-    if !meta.stdout.is_empty() {
-        print!("{}", meta.stdout);
-    }
-    if !meta.stderr.is_empty() {
-        eprint!("{}", meta.stderr);
-    }
+    replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
     clean_incremental_dir(config, args);
     Some(0)
 }
