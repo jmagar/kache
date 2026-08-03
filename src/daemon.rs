@@ -16,6 +16,7 @@ use crate::events;
 use crate::store::Store;
 
 const KEY_CACHE_AUTHORITATIVE_MULTIPLIER: u64 = 5;
+const KEY_CACHE_AUTHORITATIVE_MAX_SECS: u64 = 300;
 const REMOTE_CHECK_WARMING_GRACE: Duration = Duration::from_millis(750);
 const REMOTE_HEAD_FAILURE_THRESHOLD: u32 = 3;
 const REMOTE_HEAD_DEGRADED_FOR: Duration = Duration::from_secs(45);
@@ -987,8 +988,10 @@ fn prefetch_concurrency_cap(s3_concurrency: u32) -> usize {
 }
 
 fn key_cache_absence_is_authoritative(refresh_secs: u64, age: Option<Duration>) -> bool {
-    let authoritative_for =
-        Duration::from_secs(refresh_secs.saturating_mul(KEY_CACHE_AUTHORITATIVE_MULTIPLIER));
+    let authoritative_secs = refresh_secs
+        .saturating_mul(KEY_CACHE_AUTHORITATIVE_MULTIPLIER)
+        .min(KEY_CACHE_AUTHORITATIVE_MAX_SECS);
+    let authoritative_for = Duration::from_secs(authoritative_secs);
     refresh_secs > 0 && matches!(age, Some(age) if age <= authoritative_for)
 }
 
@@ -5500,6 +5503,14 @@ mod tests {
         assert!(!key_cache_absence_is_authoritative(
             60,
             Some(Duration::from_secs(301))
+        ));
+        assert!(key_cache_absence_is_authoritative(
+            3_600,
+            Some(Duration::from_secs(KEY_CACHE_AUTHORITATIVE_MAX_SECS))
+        ));
+        assert!(!key_cache_absence_is_authoritative(
+            3_600,
+            Some(Duration::from_secs(KEY_CACHE_AUTHORITATIVE_MAX_SECS + 1))
         ));
     }
 

@@ -2020,6 +2020,8 @@ mod tests {
             cache: Some(CacheFileConfig {
                 key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 path_only_env_vars: Some(vec!["BUILDCONFIG_RS".to_string()]),
+                prefetch_enabled: Some(false),
+                remote_key_cache_refresh_secs: Some(900),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2033,6 +2035,11 @@ mod tests {
         assert_eq!(
             state.preserved_advanced.path_only_env_vars.as_deref(),
             Some(&["BUILDCONFIG_RS".to_string()][..])
+        );
+        assert_eq!(state.preserved_advanced.prefetch_enabled, Some(false));
+        assert_eq!(
+            state.preserved_advanced.remote_key_cache_refresh_secs,
+            Some(900)
         );
 
         // ...and back out again through the save path.
@@ -2065,6 +2072,8 @@ mod tests {
             cache.path_only_env_vars.as_deref(),
             Some(&["BUILDCONFIG_RS".to_string()][..])
         );
+        assert_eq!(cache.prefetch_enabled, Some(false));
+        assert_eq!(cache.remote_key_cache_refresh_secs, Some(900));
     }
 
     #[test]

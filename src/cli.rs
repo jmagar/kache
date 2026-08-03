@@ -422,9 +422,12 @@ pub(crate) fn render_stats(
     // has something to report, so local-only output stays unchanged.
     let pf = &snap.prefetch;
     if snap.daemon_connected && config.remote.is_some() && !config.prefetch_enabled {
-        lines.push(
-            "Prefetch:   disabled (exact remote lookup and uploads remain enabled)".to_string(),
-        );
+        let remote_mode = if config.remote_readonly {
+            "exact remote lookup remains enabled; uploads are disabled (read-only remote)"
+        } else {
+            "exact remote lookup and uploads remain enabled"
+        };
+        lines.push(format!("Prefetch:   disabled ({remote_mode})"));
     } else if snap.daemon_connected
         && (pf.downloads_completed > 0
             || pf.plans_advisory + pf.plans_fallback > 0
@@ -5410,6 +5413,14 @@ mod tests {
         assert!(
             out.contains("Prefetch:   disabled (exact remote lookup and uploads remain enabled)")
         );
+
+        let mut read_only = disabled.clone();
+        read_only.remote_readonly = true;
+        let out = render_stats(&quiet, &blobs, &read_only, 24).join("\n");
+        assert!(out.contains(
+            "Prefetch:   disabled (exact remote lookup remains enabled; uploads are disabled (read-only remote))"
+        ));
+        assert!(!out.contains("uploads remain enabled"));
         assert!(!out.contains("Planning:"));
         assert!(!out.contains("Key LIST:"));
     }

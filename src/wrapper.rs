@@ -2608,7 +2608,7 @@ fn explain_miss_diff(
 /// build session sends the hint — without this, N parallel rustc invocations
 /// would all race past the check and send duplicate prefetch requests.
 fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
-    if config.remote.is_none() {
+    if config.remote.is_none() || !config.prefetch_enabled {
         return;
     }
 
@@ -4510,6 +4510,29 @@ mod tests {
         maybe_trigger_prefetch(&config, &args);
 
         assert!(!cache_dir.join(".build-session").exists());
+    }
+
+    #[test]
+    fn maybe_trigger_prefetch_returns_immediately_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let mut config = test_config(cache_dir.clone());
+        config.remote = Some(crate::config::RemoteConfig {
+            prefix: "rust".to_string(),
+            backend: crate::config::RemoteBackendConfig::Filesystem(
+                crate::config::FilesystemRemoteConfig {
+                    root: dir.path().join("remote"),
+                    atomic_write_dir: dir.path().join("remote-tmp"),
+                },
+            ),
+        });
+        config.prefetch_enabled = false;
+        let args = rustc_args(&["rustc", "src/lib.rs", "--crate-name", "foo"]);
+
+        maybe_trigger_prefetch(&config, &args);
+
+        assert!(!cache_dir.join(".build-session").exists());
+        assert!(!cache_dir.join(".build-sessions").exists());
     }
 
     /// Incremental cleanup only removes a real directory when the config flag
