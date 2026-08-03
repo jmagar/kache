@@ -123,6 +123,8 @@ struct EditorState {
     /// carry it through verbatim on save (dropping it would silently disable the
     /// env lockdown).
     preserved_ignore_env: Option<bool>,
+    preserved_prefetch_enabled: Option<bool>,
+    preserved_remote_key_cache_refresh_secs: Option<u64>,
     /// `[cache] prefetch_*` budgets as loaded — the editor has no form fields
     /// for them, so carry them through verbatim on save; dropping them would
     /// silently restore unbounded prefetch plans (kunobi-ninja/kache#616).
@@ -667,6 +669,8 @@ fn fields_to_file_config(
     preserved_heartbeat_secs: Option<u64>,
     preserved_explain_miss: Option<bool>,
     preserved_ignore_env: Option<bool>,
+    preserved_prefetch_enabled: Option<bool>,
+    preserved_remote_key_cache_refresh_secs: Option<u64>,
     preserved_prefetch_max_keys: Option<u64>,
     preserved_prefetch_max_bytes: Option<String>,
     preserved_prefetch_deadline_secs: Option<u64>,
@@ -766,6 +770,8 @@ fn fields_to_file_config(
             heartbeat_secs: preserved_heartbeat_secs,
             explain_miss: preserved_explain_miss,
             ignore_env: preserved_ignore_env,
+            prefetch_enabled: preserved_prefetch_enabled,
+            remote_key_cache_refresh_secs: preserved_remote_key_cache_refresh_secs,
             prefetch_max_keys: preserved_prefetch_max_keys,
             prefetch_max_bytes: preserved_prefetch_max_bytes,
             prefetch_deadline_secs: preserved_prefetch_deadline_secs,
@@ -834,6 +840,11 @@ pub fn run_config_editor() -> Result<()> {
         preserved_heartbeat_secs: file_config.cache.as_ref().and_then(|c| c.heartbeat_secs),
         preserved_explain_miss: file_config.cache.as_ref().and_then(|c| c.explain_miss),
         preserved_ignore_env: file_config.cache.as_ref().and_then(|c| c.ignore_env),
+        preserved_prefetch_enabled: file_config.cache.as_ref().and_then(|c| c.prefetch_enabled),
+        preserved_remote_key_cache_refresh_secs: file_config
+            .cache
+            .as_ref()
+            .and_then(|c| c.remote_key_cache_refresh_secs),
         preserved_prefetch_max_keys: file_config.cache.as_ref().and_then(|c| c.prefetch_max_keys),
         preserved_prefetch_max_bytes: file_config
             .cache
@@ -1038,6 +1049,8 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_heartbeat_secs,
         state.preserved_explain_miss,
         state.preserved_ignore_env,
+        state.preserved_prefetch_enabled,
+        state.preserved_remote_key_cache_refresh_secs,
         state.preserved_prefetch_max_keys,
         state.preserved_prefetch_max_bytes.clone(),
         state.preserved_prefetch_deadline_secs,
@@ -1863,6 +1876,8 @@ mod tests {
                 event_log_keep_lines: Some(500),
                 compression_level: Some(3),
                 s3_concurrency: Some(8),
+                prefetch_enabled: Some(false),
+                remote_key_cache_refresh_secs: Some(900),
                 prefetch_max_keys: None,
                 prefetch_max_bytes: None,
                 prefetch_deadline_secs: None,
@@ -1905,6 +1920,11 @@ mod tests {
             original.cache.as_ref().and_then(|c| c.heartbeat_secs),
             original.cache.as_ref().and_then(|c| c.explain_miss),
             original.cache.as_ref().and_then(|c| c.ignore_env),
+            original.cache.as_ref().and_then(|c| c.prefetch_enabled),
+            original
+                .cache
+                .as_ref()
+                .and_then(|c| c.remote_key_cache_refresh_secs),
             original.cache.as_ref().and_then(|c| c.prefetch_max_keys),
             original
                 .cache
@@ -1925,6 +1945,8 @@ mod tests {
             Some(&["/snap".to_string(), "/var/lib/flatpak".to_string()][..])
         );
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
+        assert_eq!(cache.prefetch_enabled, Some(false));
+        assert_eq!(cache.remote_key_cache_refresh_secs, Some(900));
         // The editor has no planner fields, but a save must preserve the
         // loaded `[cache.planner]` section verbatim (endpoint + token).
         let planner = cache.planner.as_ref().expect("planner preserved on save");
@@ -1974,7 +1996,7 @@ mod tests {
         let fields = build_fields(&original, &empty_env());
         let reconstructed = fields_to_file_config(
             &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None,
+            None, None, None, None, None, None,
         );
         let remote = reconstructed
             .cache
@@ -2001,7 +2023,7 @@ mod tests {
         let fields = build_fields(&config, &empty_env());
         let result = fields_to_file_config(
             &fields, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None,
+            None, None, None, None, None, None,
         );
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
@@ -2078,6 +2100,8 @@ mod tests {
             preserved_heartbeat_secs: None,
             preserved_explain_miss: None,
             preserved_ignore_env: None,
+            preserved_prefetch_enabled: None,
+            preserved_remote_key_cache_refresh_secs: None,
             preserved_prefetch_max_keys: None,
             preserved_prefetch_max_bytes: None,
             preserved_prefetch_deadline_secs: None,
