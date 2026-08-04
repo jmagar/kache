@@ -1,0 +1,189 @@
+---
+title: Fleet releases
+description: Guarded internal release process for official upstream-based builds and unreleased fleet snapshots.
+---
+
+# Fleet releases
+
+This repository is a fork used to build the Kache binaries deployed on Dookie
+and the Tootie runner farm. Fleet releases are deployment artifacts. They are
+separate from official `kunobi-ninja/kache` releases and must never publish
+crates or public OS packages.
+
+## Release classes
+
+### Official-upstream-based fleet release
+
+Use this only when upstream has published `v<manifest-version>` and that tag
+resolves to the exact upstream base included by the fleet source commit.
+
+Tag shape:
+
+```text
+fleet-v<version>.<fleet-revision>
+```
+
+Example:
+
+```text
+fleet-v0.13.0.1
+```
+
+These are normal GitHub releases, not prereleases.
+
+### Unreleased-upstream fleet snapshot
+
+Use this for an explicitly selected upstream `main` snapshot that has not become
+the matching official upstream release.
+
+Tag shape:
+
+```text
+fleet-snapshot-v<version>-<source-short-sha>.<fleet-revision>
+```
+
+Example:
+
+```text
+fleet-snapshot-v0.13.0-9f3b75f.1
+```
+
+Snapshots are always GitHub prereleases. The source SHA in the tag prevents an
+unreleased build from looking like an official versioned release.
+
+## Guard invariants
+
+`scripts/ci/plan-fleet-release.sh` is the source of truth for fleet release
+identity.
+
+It fails closed unless all of these hold:
+
+- the source ref and included upstream base resolve to commits;
+- the included upstream base is an ancestor of the fleet source;
+- the root `Cargo.toml` version is valid;
+- official mode finds upstream `v<version>`;
+- official mode finds that the upstream tag resolves exactly to the included
+  upstream base;
+- snapshot mode uses the SHA-bearing snapshot tag;
+- snapshot mode refuses a base that already matches the official upstream tag;
+- the fleet revision is a positive integer.
+
+The `Fleet Release` workflow also refuses an existing candidate tag or release,
+runs the guard tests, formatting, focused prefetch regression, strict Clippy,
+and a release build before packaging anything.
+
+Publishing is opt-in. The workflow defaults to a validation-only dry run. It always validates and builds the protected `main` branch; arbitrary source refs are not accepted by the write-capable release lane.
+
+## Running the workflow
+
+Dry-run an unreleased snapshot:
+
+```bash
+gh workflow run fleet-release.yml \
+  --repo jmagar/kache \
+  -f mode=snapshot \
+  -f upstream_base=f3eaa893aef6e6c188faeb0d3df8638780bf64b6 \
+  -f revision=1 \
+  -f publish=false
+```
+
+Publish after the dry run is green:
+
+```bash
+gh workflow run fleet-release.yml \
+  --repo jmagar/kache \
+  -f mode=snapshot \
+  -f upstream_base=f3eaa893aef6e6c188faeb0d3df8638780bf64b6 \
+  -f revision=1 \
+  -f publish=true
+```
+
+For an official-upstream-based build, change `mode` to `official`. The workflow
+will refuse to publish until the matching upstream tag exists and points to the
+specified base.
+
+## Package publication boundary
+
+Fleet tags begin with `fleet-`.
+
+The crates.io and OS package-manager workflows have explicit job guards that
+skip every `fleet-*` GitHub release. Fleet artifacts are for internal deployment
+only and cannot fan out to crates.io, apt, Homebrew, Winget, Scoop, Chocolatey,
+or AUR.
+
+## Current deployed snapshot
+
+The currently deployed bytes remain:
+
+```text
+tag:            fleet-v0.13.0-prefetch-controls.1
+fleet source:   9f3b75f4b1fe3f116d6a289c8b10dd3b395d87cb
+upstream base:  f3eaa893aef6e6c188faeb0d3df8638780bf64b6
+binary sha256:  87cddc742db80394a77e3c9e9cd53fb280bf2b3da2b2fd4c344d70820df46b06
+```
+
+That tag predates the snapshot naming rule and is retained for immutability.
+Its GitHub release title, notes, and prerelease flag identify it clearly as an
+unreleased-upstream fleet snapshot. No deployed bytes were changed by the
+metadata correction.
+
+Dookie and the runner farm should continue using those bytes until an intentional
+replacement passes the complete rollout gate.
+
+## When upstream publishes the matching release
+
+When upstream `v0.13.0` appears:
+
+1. Fetch and resolve the official tag:
+
+   ```bash
+   git fetch upstream --tags
+   git rev-parse 'v0.13.0^{}'
+   ```
+
+2. Compare it with the deployed snapshot's included upstream base:
+
+   ```bash
+   git log --oneline --left-right \
+     f3eaa893aef6e6c188faeb0d3df8638780bf64b6...v0.13.0
+   git diff --stat \
+     f3eaa893aef6e6c188faeb0d3df8638780bf64b6..v0.13.0
+   ```
+
+3. Prepare a fork branch based on the official upstream tag and replay any
+   still-required fleet-only commits. This does not require submitting changes
+   upstream.
+
+4. Run the same release gates used for the deployed snapshot:
+
+   - fleet release guard tests;
+   - strict Clippy;
+   - prefetch mutation matrix with zero missed mutants;
+   - clean MinIO producer/consumer proof;
+   - debug-path cold, warm, no-op, and relocation scenario;
+   - checksum-pinned runner image validation.
+
+5. Publish using `mode=official`. The expected first tag is:
+
+   ```text
+   fleet-v0.13.0.1
+   ```
+
+6. Deploy Dookie first, then promote a checksum-pinned runner image through the
+   drain-aware reconciler.
+
+7. Retain the current snapshot image and binary as rollback until the
+   official-based fleet build has proven stable.
+
+## Rollout requirements
+
+Every fleet deployment must preserve these invariants:
+
+- Dookie and all runners use identical binary bytes;
+- `prefetch_enabled = false` on persistent hosts;
+- exact remote lookups and uploads remain enabled;
+- the old image and binary remain available as rollback;
+- busy runners are never interrupted;
+- all runners finish with `stale=0`, `error=0`, and the expected checksum;
+- temporary worktrees, branches, build containers, and scratch files are
+  removed after verification.
