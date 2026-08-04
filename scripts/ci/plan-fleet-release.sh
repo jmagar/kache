@@ -85,7 +85,12 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" ||
   die "run this command inside a git repository"
 cd "$repo_root"
 
-[[ -f Cargo.toml ]] || die "Cargo.toml is missing from repository root"
+source_sha="$(git rev-parse "${source_ref}^{commit}" 2>/dev/null)" ||
+  die "source ref does not resolve to a commit: $source_ref"
+source_short="${source_sha:0:7}"
+
+manifest="$(git show "${source_sha}:Cargo.toml" 2>/dev/null)" ||
+  die "Cargo.toml is missing from source commit $source_sha"
 version="$(awk '
   /^\[package\]$/ { in_package = 1; next }
   in_package && /^\[/ { exit }
@@ -95,14 +100,11 @@ version="$(awk '
     print value
     exit
   }
-' Cargo.toml)"
-[[ -n "$version" ]] || die "could not read [package] version from Cargo.toml"
+' <<<"$manifest")"
+[[ -n "$version" ]] ||
+  die "could not read [package] version from source commit $source_sha"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] ||
   die "manifest version is not valid semver-like text: $version"
-
-source_sha="$(git rev-parse "${source_ref}^{commit}" 2>/dev/null)" ||
-  die "source ref does not resolve to a commit: $source_ref"
-source_short="${source_sha:0:7}"
 
 if [[ -n "$upstream_base_ref" ]]; then
   upstream_base="$(git rev-parse "${upstream_base_ref}^{commit}" 2>/dev/null)" ||
@@ -118,6 +120,11 @@ git merge-base --is-ancestor "$upstream_base" "$source_sha" ||
   die "upstream base $upstream_base is not an ancestor of source $source_sha"
 
 upstream_tag="v${version}"
+if ! tag_output="$(git ls-remote --tags "$upstream_url" \
+  "refs/tags/${upstream_tag}" "refs/tags/${upstream_tag}^{}" 2>&1)"; then
+  die "failed to query upstream tag $upstream_tag at $upstream_url: $tag_output"
+fi
+
 tag_direct=""
 tag_peeled=""
 while read -r sha ref; do
@@ -126,8 +133,7 @@ while read -r sha ref; do
     "refs/tags/${upstream_tag}") tag_direct="$sha" ;;
     "refs/tags/${upstream_tag}^{}") tag_peeled="$sha" ;;
   esac
-done < <(git ls-remote --tags "$upstream_url" \
-  "refs/tags/${upstream_tag}" "refs/tags/${upstream_tag}^{}")
+done <<<"$tag_output"
 upstream_tag_commit="${tag_peeled:-$tag_direct}"
 
 case "$mode" in

@@ -72,7 +72,7 @@ The `Fleet Release` workflow also refuses an existing candidate tag or release,
 runs the guard tests, formatting, focused prefetch regression, strict Clippy,
 and a release build before packaging anything.
 
-Publishing is opt-in. The workflow defaults to a validation-only dry run.
+Publishing is opt-in. The workflow defaults to a validation-only dry run. It always validates and builds the protected `main` branch; arbitrary source refs are not accepted by the write-capable release lane.
 
 ## Running the workflow
 
@@ -82,7 +82,6 @@ Dry-run an unreleased snapshot:
 gh workflow run fleet-release.yml \
   --repo jmagar/kache \
   -f mode=snapshot \
-  -f source_ref=main \
   -f upstream_base=f3eaa893aef6e6c188faeb0d3df8638780bf64b6 \
   -f revision=1 \
   -f publish=false
@@ -94,7 +93,6 @@ Publish after the dry run is green:
 gh workflow run fleet-release.yml \
   --repo jmagar/kache \
   -f mode=snapshot \
-  -f source_ref=main \
   -f upstream_base=f3eaa893aef6e6c188faeb0d3df8638780bf64b6 \
   -f revision=1 \
   -f publish=true

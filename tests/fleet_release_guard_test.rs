@@ -50,9 +50,31 @@ fn commit_all(dir: &Path, message: &str) {
             "user.name=Fleet Test",
             "-c",
             "user.email=fleet@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-m",
             message,
+        ],
+    );
+}
+
+fn tag_annotated(dir: &Path, target: &str, message: &str) {
+    run_git(
+        dir,
+        &[
+            "-c",
+            "user.name=Fleet Test",
+            "-c",
+            "user.email=fleet@example.invalid",
+            "-c",
+            "tag.gpgSign=false",
+            "tag",
+            "-a",
+            "v0.13.0",
+            "-m",
+            message,
+            target,
         ],
     );
 }
@@ -78,21 +100,7 @@ fn fixture(tag: UpstreamTag) -> Fixture {
     let first_base = git_stdout(&upstream_work, &["rev-parse", "HEAD"]);
 
     if matches!(tag, UpstreamTag::Mismatched) {
-        run_git(
-            &upstream_work,
-            &[
-                "-c",
-                "user.name=Fleet Test",
-                "-c",
-                "user.email=fleet@example.invalid",
-                "tag",
-                "-a",
-                "v0.13.0",
-                "-m",
-                "older official tag",
-                &first_base,
-            ],
-        );
+        tag_annotated(&upstream_work, &first_base, "older official tag");
         fs::write(
             upstream_work.join("src/main.rs"),
             "fn main() { println!(\"newer\"); }\n",
@@ -103,21 +111,7 @@ fn fixture(tag: UpstreamTag) -> Fixture {
 
     let upstream_base = git_stdout(&upstream_work, &["rev-parse", "HEAD"]);
     if matches!(tag, UpstreamTag::Matching) {
-        run_git(
-            &upstream_work,
-            &[
-                "-c",
-                "user.name=Fleet Test",
-                "-c",
-                "user.email=fleet@example.invalid",
-                "tag",
-                "-a",
-                "v0.13.0",
-                "-m",
-                "official tag",
-                &upstream_base,
-            ],
-        );
+        tag_annotated(&upstream_work, &upstream_base, "official tag");
     }
 
     run_git(
@@ -137,6 +131,15 @@ fn fixture(tag: UpstreamTag) -> Fixture {
             source.to_str().unwrap(),
         ],
     );
+    run_git(
+        &source,
+        &["remote", "add", "upstream", upstream_bare.to_str().unwrap()],
+    );
+    run_git(
+        &source,
+        &["fetch", "upstream", "main:refs/remotes/upstream/main"],
+    );
+
     fs::write(source.join("fleet.txt"), "fork-only fleet controls\n").unwrap();
     commit_all(&source, "fork fleet change");
     let source_sha = git_stdout(&source, &["rev-parse", "HEAD"]);
@@ -150,25 +153,33 @@ fn fixture(tag: UpstreamTag) -> Fixture {
     }
 }
 
-fn run_guard(fixture: &Fixture, mode: &str, revision: &str) -> Output {
+fn run_guard_with(
+    fixture: &Fixture,
+    mode: &str,
+    revision: &str,
+    include_base: bool,
+    upstream_url: &Path,
+) -> Output {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ci/plan-fleet-release.sh");
-    Command::new("bash")
-        .current_dir(&fixture.source)
-        .arg(script)
-        .args([
-            "--mode",
-            mode,
-            "--revision",
-            revision,
-            "--source-ref",
-            "HEAD",
-            "--upstream-url",
-            fixture.upstream_bare.to_str().unwrap(),
-            "--upstream-base",
-            &fixture.upstream_base,
-        ])
-        .output()
-        .expect("fleet release guard should start")
+    let mut command = Command::new("bash");
+    command.current_dir(&fixture.source).arg(script).args([
+        "--mode",
+        mode,
+        "--revision",
+        revision,
+        "--source-ref",
+        "HEAD",
+        "--upstream-url",
+        upstream_url.to_str().unwrap(),
+    ]);
+    if include_base {
+        command.args(["--upstream-base", &fixture.upstream_base]);
+    }
+    command.output().expect("fleet release guard should start")
+}
+
+fn run_guard(fixture: &Fixture, mode: &str, revision: &str) -> Output {
+    run_guard_with(fixture, mode, revision, true, &fixture.upstream_bare)
 }
 
 fn plan(output: &Output) -> HashMap<String, String> {
@@ -238,22 +249,84 @@ fn snapshot_mode_refuses_a_base_that_is_already_official() {
 }
 
 #[test]
+fn planner_derives_the_upstream_base_from_the_tracking_ref() {
+    let fixture = fixture(UpstreamTag::Missing);
+    let fields = plan(&run_guard_with(
+        &fixture,
+        "snapshot",
+        "1",
+        false,
+        &fixture.upstream_bare,
+    ));
+    assert_eq!(fields["upstream_base"], fixture.upstream_base);
+}
+
+#[test]
+fn planner_reads_the_manifest_from_the_selected_source_commit() {
+    let fixture = fixture(UpstreamTag::Missing);
+    fs::write(
+        fixture.source.join("Cargo.toml"),
+        "[package]\nname = \"kache\"\nversion = \"9.9.9\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    let fields = plan(&run_guard(&fixture, "snapshot", "1"));
+    assert_eq!(fields["version"], "0.13.0");
+}
+
+#[test]
+fn planner_fails_closed_when_upstream_tag_lookup_fails() {
+    let fixture = fixture(UpstreamTag::Missing);
+    let missing = fixture._temp.path().join("missing-upstream.git");
+    let output = run_guard_with(&fixture, "snapshot", "1", true, &missing);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to query upstream tag"));
+}
+
+#[test]
 fn fleet_releases_cannot_trigger_public_package_publishers() {
     let packages = include_str!("../.github/workflows/package-publish.yml");
     let crates = include_str!("../.github/workflows/publish-crates.yaml");
     let fleet = include_str!("../.github/workflows/fleet-release.yml");
-    let planner = include_str!("../scripts/ci/plan-fleet-release.sh");
 
     let guard = "!startsWith(github.event.release.tag_name, 'fleet-')";
+    let package_resolve = packages
+        .split("\n  resolve:\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  gate:\n").next())
+        .expect("package resolve job");
+    let crates_publish = crates
+        .split("\n  publish:\n")
+        .nth(1)
+        .expect("crates publish job");
     assert!(
-        packages.contains(guard),
-        "OS package publication must ignore fleet-only releases"
+        package_resolve.contains(guard),
+        "OS package resolve job must ignore fleet-only releases"
     );
     assert!(
-        crates.contains(guard),
-        "crates.io publication must ignore fleet-only releases"
+        crates_publish.contains(guard),
+        "crates.io publish job must ignore fleet-only releases"
     );
-    assert!(fleet.contains("scripts/ci/plan-fleet-release.sh"));
-    assert!(fleet.contains("default: false"));
-    assert!(planner.contains("fleet-snapshot-v${version}-${source_short}.${revision}"));
+
+    let publish_input = fleet
+        .split("\n      publish:\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\npermissions:").next())
+        .expect("publish workflow input");
+    assert!(publish_input.contains("type: boolean"));
+    assert!(publish_input.contains("default: false"));
+
+    let validate_job = fleet
+        .split("\n  validate:\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  publish:\n").next())
+        .expect("validate job");
+    assert!(validate_job.contains("permissions:\n      contents: read"));
+    assert!(validate_job.contains("ref: main"));
+    assert!(!fleet.contains("source_ref:"));
+
+    let publish_job = fleet.split("\n  publish:\n").nth(1).expect("publish job");
+    assert!(publish_job.contains("permissions:\n      contents: write"));
+    assert!(publish_job.contains("actions/download-artifact@"));
+    assert!(publish_job.contains("git push origin \":refs/tags/$FLEET_TAG\""));
+    assert!(publish_job.contains("gh release delete \"$FLEET_TAG\""));
 }

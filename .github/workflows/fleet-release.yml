@@ -11,11 +11,6 @@ on:
           - snapshot
           - official
         default: snapshot
-      source_ref:
-        description: Source ref to build and tag
-        required: true
-        type: string
-        default: main
       upstream_base:
         description: Exact included upstream commit (blank derives merge-base with upstream/main)
         required: false
@@ -33,28 +28,44 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: fleet-release
   cancel-in-progress: false
 
 jobs:
-  fleet:
+  validate:
     name: Validate and package fleet release
-    if: github.repository == 'jmagar/kache'
+    if: github.repository == 'jmagar/kache' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      version: ${{ steps.plan.outputs.version }}
+      revision: ${{ steps.plan.outputs.revision }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      upstream_base: ${{ steps.plan.outputs.upstream_base }}
+      upstream_tag: ${{ steps.plan.outputs.upstream_tag }}
+      upstream_tag_commit: ${{ steps.plan.outputs.upstream_tag_commit }}
+      upstream_tag_status: ${{ steps.plan.outputs.upstream_tag_status }}
+      fleet_tag: ${{ steps.plan.outputs.fleet_tag }}
+      release_title: ${{ steps.plan.outputs.release_title }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      artifact_name: ${{ steps.plan.outputs.fleet_tag }}
     env:
       CARGO_TERM_COLOR: always
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      - name: Checkout fleet source
+      - name: Checkout protected fleet source
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: main
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Fetch upstream history
         run: |
@@ -115,6 +126,7 @@ jobs:
           UPSTREAM_TAG_STATUS: ${{ steps.plan.outputs.upstream_tag_status }}
           FLEET_TAG: ${{ steps.plan.outputs.fleet_tag }}
           PRERELEASE: ${{ steps.plan.outputs.prerelease }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
         run: |
           {
             echo "## Fleet release plan"
@@ -128,7 +140,7 @@ jobs:
             echo "- Upstream tag status: \`$UPSTREAM_TAG_STATUS\`"
             echo "- Candidate: \`$FLEET_TAG\`"
             echo "- Prerelease: \`$PRERELEASE\`"
-            echo "- Publish requested: \`${{ inputs.publish }}\`"
+            echo "- Publish requested: \`$PUBLISH_REQUESTED\`"
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Validate fleet release guard tests
@@ -159,7 +171,6 @@ jobs:
           UPSTREAM_TAG_COMMIT: ${{ steps.plan.outputs.upstream_tag_commit }}
           UPSTREAM_TAG_STATUS: ${{ steps.plan.outputs.upstream_tag_status }}
           FLEET_TAG: ${{ steps.plan.outputs.fleet_tag }}
-          RELEASE_TITLE: ${{ steps.plan.outputs.release_title }}
           PRERELEASE: ${{ steps.plan.outputs.prerelease }}
         run: |
           set -euo pipefail
@@ -241,21 +252,109 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish immutable fleet tag and release
-        if: inputs.publish
+  publish:
+    name: Publish immutable fleet release
+    needs: validate
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MODE: ${{ needs.validate.outputs.mode }}
+      VERSION: ${{ needs.validate.outputs.version }}
+      REVISION: ${{ needs.validate.outputs.revision }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+      UPSTREAM_BASE: ${{ needs.validate.outputs.upstream_base }}
+      FLEET_TAG: ${{ needs.validate.outputs.fleet_tag }}
+      RELEASE_TITLE: ${{ needs.validate.outputs.release_title }}
+      PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+
+    steps:
+      - name: Checkout validated protected-main commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Download validated fleet package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ needs.validate.outputs.artifact_name }}
+          path: tmp/fleet-release-download
+
+      - name: Reverify source and package
+        id: verify
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ]
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          git merge-base --is-ancestor "$UPSTREAM_BASE" "$SOURCE_SHA"
+
+          expected_tag=""
+          case "$MODE" in
+            snapshot)
+              expected_tag="fleet-snapshot-v${VERSION}-${SOURCE_SHA:0:7}.${REVISION}"
+              ;;
+            official)
+              expected_tag="fleet-v${VERSION}.${REVISION}"
+              ;;
+            *)
+              echo "::error::invalid validated mode: $MODE"
+              exit 1
+              ;;
+          esac
+          [ "$FLEET_TAG" = "$expected_tag" ]
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$FLEET_TAG" >/dev/null 2>&1; then
+            echo "::error::fleet tag appeared after validation: $FLEET_TAG"
+            exit 1
+          fi
+          if gh release view "$FLEET_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::fleet release appeared after validation: $FLEET_TAG"
+            exit 1
+          fi
+
+          mapfile -t assets < <(find tmp/fleet-release-download -maxdepth 1 -type f -name '*.tar.gz' -print)
+          [ "${#assets[@]}" -eq 1 ]
+          asset="${assets[0]}"
+          sidecar="$asset.sha256"
+          notes="tmp/fleet-release-download/release-notes.md"
+          [ -f "$sidecar" ]
+          [ -f "$notes" ]
+
+          (
+            cd "$(dirname "$asset")"
+            sha256sum -c "$(basename "$sidecar")"
+          )
+
+          unpack="$(mktemp -d)"
+          trap 'rm -rf "$unpack"' EXIT
+          tar -xzf "$asset" -C "$unpack" kache BUILD-INFO.txt
+          binary_sha="$(sha256sum "$unpack/kache" | awk '{print $1}')"
+          grep -Fxq "fleet_tag=$FLEET_TAG" "$unpack/BUILD-INFO.txt"
+          grep -Fxq "source_commit=$SOURCE_SHA" "$unpack/BUILD-INFO.txt"
+          grep -Fxq "upstream_base=$UPSTREAM_BASE" "$unpack/BUILD-INFO.txt"
+          grep -Fxq "binary_sha256=$binary_sha" "$unpack/BUILD-INFO.txt"
+
+          {
+            echo "asset=$asset"
+            echo "sidecar=$sidecar"
+            echo "notes=$notes"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Publish tag and release with rollback
         env:
-          FLEET_TAG: ${{ steps.plan.outputs.fleet_tag }}
-          RELEASE_TITLE: ${{ steps.plan.outputs.release_title }}
-          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
-          PRERELEASE: ${{ steps.plan.outputs.prerelease }}
-          ASSET: ${{ steps.package.outputs.asset }}
-          SIDECAR: ${{ steps.package.outputs.sidecar }}
-          NOTES: ${{ steps.package.outputs.notes }}
+          ASSET: ${{ steps.verify.outputs.asset }}
+          SIDECAR: ${{ steps.verify.outputs.sidecar }}
+          NOTES: ${{ steps.verify.outputs.notes }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$FLEET_TAG" "$SOURCE_SHA" -m "$RELEASE_TITLE"
+          git -c tag.gpgSign=false tag -a "$FLEET_TAG" "$SOURCE_SHA" -m "$RELEASE_TITLE"
           git push origin "$FLEET_TAG"
 
           args=(
@@ -270,4 +369,16 @@ jobs:
           if [ "$PRERELEASE" = true ]; then
             args+=(--prerelease)
           fi
+
+          set +e
           gh release create "${args[@]}"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::release creation failed; removing partial release and tag"
+            gh release delete "$FLEET_TAG" --repo "$GITHUB_REPOSITORY" \
+              --yes --cleanup-tag >/dev/null 2>&1 || true
+            git push origin ":refs/tags/$FLEET_TAG" >/dev/null 2>&1 || true
+            git tag -d "$FLEET_TAG" >/dev/null 2>&1 || true
+            exit "$rc"
+          fi
