@@ -1,0 +1,273 @@
+name: Fleet Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Official upstream-tagged release or explicit unreleased snapshot
+        required: true
+        type: choice
+        options:
+          - snapshot
+          - official
+        default: snapshot
+      source_ref:
+        description: Source ref to build and tag
+        required: true
+        type: string
+        default: main
+      upstream_base:
+        description: Exact included upstream commit (blank derives merge-base with upstream/main)
+        required: false
+        type: string
+        default: ""
+      revision:
+        description: Positive fleet release revision
+        required: true
+        type: string
+        default: "1"
+      publish:
+        description: Create the immutable tag and GitHub release
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fleet-release
+  cancel-in-progress: false
+
+jobs:
+  fleet:
+    name: Validate and package fleet release
+    if: github.repository == 'jmagar/kache'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout fleet source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Fetch upstream history
+        run: |
+          set -euo pipefail
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/kunobi-ninja/kache.git
+          else
+            git remote add upstream https://github.com/kunobi-ninja/kache.git
+          fi
+          git fetch --no-tags upstream main
+
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: 2026.6.9
+          cache: false
+
+      - name: Plan and guard release identity
+        id: plan
+        env:
+          MODE: ${{ inputs.mode }}
+          REVISION: ${{ inputs.revision }}
+          UPSTREAM_BASE: ${{ inputs.upstream_base }}
+        run: |
+          set -euo pipefail
+          args=(
+            --mode "$MODE"
+            --revision "$REVISION"
+            --source-ref HEAD
+            --upstream-url https://github.com/kunobi-ninja/kache.git
+          )
+          if [ -n "$UPSTREAM_BASE" ]; then
+            args+=(--upstream-base "$UPSTREAM_BASE")
+          fi
+          ./scripts/ci/plan-fleet-release.sh "${args[@]}" --output "$GITHUB_OUTPUT"
+
+      - name: Refuse an existing candidate
+        env:
+          FLEET_TAG: ${{ steps.plan.outputs.fleet_tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$FLEET_TAG" >/dev/null 2>&1; then
+            echo "::error::fleet tag already exists: $FLEET_TAG"
+            exit 1
+          fi
+          if gh release view "$FLEET_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::fleet release already exists: $FLEET_TAG"
+            exit 1
+          fi
+
+      - name: Summarize guarded plan
+        env:
+          MODE: ${{ steps.plan.outputs.mode }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          UPSTREAM_BASE: ${{ steps.plan.outputs.upstream_base }}
+          UPSTREAM_TAG: ${{ steps.plan.outputs.upstream_tag }}
+          UPSTREAM_TAG_COMMIT: ${{ steps.plan.outputs.upstream_tag_commit }}
+          UPSTREAM_TAG_STATUS: ${{ steps.plan.outputs.upstream_tag_status }}
+          FLEET_TAG: ${{ steps.plan.outputs.fleet_tag }}
+          PRERELEASE: ${{ steps.plan.outputs.prerelease }}
+        run: |
+          {
+            echo "## Fleet release plan"
+            echo
+            echo "- Mode: \`$MODE\`"
+            echo "- Version: \`$VERSION\`"
+            echo "- Source: \`$SOURCE_SHA\`"
+            echo "- Included upstream base: \`$UPSTREAM_BASE\`"
+            echo "- Upstream tag: \`$UPSTREAM_TAG\`"
+            echo "- Upstream tag commit: \`${UPSTREAM_TAG_COMMIT:-missing}\`"
+            echo "- Upstream tag status: \`$UPSTREAM_TAG_STATUS\`"
+            echo "- Candidate: \`$FLEET_TAG\`"
+            echo "- Prerelease: \`$PRERELEASE\`"
+            echo "- Publish requested: \`${{ inputs.publish }}\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Validate fleet release guard tests
+        run: mise exec -- cargo test --locked --test fleet_release_guard_test
+
+      - name: Validate formatting
+        run: mise exec -- cargo fmt --all -- --check
+
+      - name: Validate source
+        run: |
+          mise exec -- cargo test --locked -p kache \
+            maybe_trigger_prefetch_records_an_enabled_build_session
+          mise exec -- cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build fleet binary
+        run: |
+          env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER -u KACHE_VERSION \
+            mise exec -- cargo build --release --locked -p kache
+
+      - name: Package checksum-pinned fleet artifact
+        id: package
+        env:
+          MODE: ${{ steps.plan.outputs.mode }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          UPSTREAM_BASE: ${{ steps.plan.outputs.upstream_base }}
+          UPSTREAM_TAG: ${{ steps.plan.outputs.upstream_tag }}
+          UPSTREAM_TAG_COMMIT: ${{ steps.plan.outputs.upstream_tag_commit }}
+          UPSTREAM_TAG_STATUS: ${{ steps.plan.outputs.upstream_tag_status }}
+          FLEET_TAG: ${{ steps.plan.outputs.fleet_tag }}
+          RELEASE_TITLE: ${{ steps.plan.outputs.release_title }}
+          PRERELEASE: ${{ steps.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          out_dir="$GITHUB_WORKSPACE/tmp/fleet-release"
+          stage="$out_dir/stage"
+          rm -rf "$out_dir"
+          mkdir -p "$stage"
+
+          install -m 0755 target/release/kache "$stage/kache"
+          binary_sha="$(sha256sum "$stage/kache" | awk '{print $1}')"
+          asset_name="kache-${FLEET_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          asset="$out_dir/$asset_name"
+
+          cat >"$stage/BUILD-INFO.txt" <<EOF
+          release_kind=$MODE
+          fleet_tag=$FLEET_TAG
+          version=$VERSION
+          source_commit=$SOURCE_SHA
+          upstream_base=$UPSTREAM_BASE
+          upstream_tag=$UPSTREAM_TAG
+          upstream_tag_commit=$UPSTREAM_TAG_COMMIT
+          upstream_tag_status=$UPSTREAM_TAG_STATUS
+          prerelease=$PRERELEASE
+          binary_sha256=$binary_sha
+          EOF
+
+          source_epoch="$(git show -s --format=%ct "$SOURCE_SHA")"
+          tar --sort=name --mtime="@$source_epoch" --owner=0 --group=0 \
+            --numeric-owner -czf "$asset" -C "$stage" kache BUILD-INFO.txt
+          archive_sha="$(sha256sum "$asset" | awk '{print $1}')"
+          printf '%s  %s\n' "$archive_sha" "$asset_name" >"$asset.sha256"
+
+          notes="$out_dir/release-notes.md"
+          if [ "$MODE" = snapshot ]; then
+            cat >"$notes" <<EOF
+          ## Fleet snapshot, not an official upstream release
+
+          This artifact was built from an explicit unreleased-upstream snapshot.
+
+          - Fleet source: \`$SOURCE_SHA\`
+          - Included upstream base: \`$UPSTREAM_BASE\`
+          - Manifest version: \`$VERSION\`
+          - Official upstream tag status: \`$UPSTREAM_TAG_STATUS\`
+          - Candidate tag: \`$FLEET_TAG\`
+          - Binary SHA-256: \`$binary_sha\`
+
+          Snapshot tags are SHA-bearing prereleases and do not publish crates or OS packages.
+          EOF
+          else
+            cat >"$notes" <<EOF
+          ## Official-upstream-based fleet release
+
+          The guard verified that upstream \`$UPSTREAM_TAG\` resolves exactly to the included upstream base.
+
+          - Fleet source: \`$SOURCE_SHA\`
+          - Included upstream base: \`$UPSTREAM_BASE\`
+          - Verified upstream tag commit: \`$UPSTREAM_TAG_COMMIT\`
+          - Candidate tag: \`$FLEET_TAG\`
+          - Binary SHA-256: \`$binary_sha\`
+          EOF
+          fi
+
+          {
+            echo "asset=$asset"
+            echo "sidecar=$asset.sha256"
+            echo "notes=$notes"
+            echo "binary_sha=$binary_sha"
+            echo "archive_sha=$archive_sha"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload validated fleet package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.plan.outputs.fleet_tag }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.sidecar }}
+            ${{ steps.package.outputs.notes }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish immutable fleet tag and release
+        if: inputs.publish
+        env:
+          FLEET_TAG: ${{ steps.plan.outputs.fleet_tag }}
+          RELEASE_TITLE: ${{ steps.plan.outputs.release_title }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          PRERELEASE: ${{ steps.plan.outputs.prerelease }}
+          ASSET: ${{ steps.package.outputs.asset }}
+          SIDECAR: ${{ steps.package.outputs.sidecar }}
+          NOTES: ${{ steps.package.outputs.notes }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$FLEET_TAG" "$SOURCE_SHA" -m "$RELEASE_TITLE"
+          git push origin "$FLEET_TAG"
+
+          args=(
+            "$FLEET_TAG"
+            "$ASSET"
+            "$SIDECAR"
+            --repo "$GITHUB_REPOSITORY"
+            --verify-tag
+            --title "$RELEASE_TITLE"
+            --notes-file "$NOTES"
+          )
+          if [ "$PRERELEASE" = true ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"

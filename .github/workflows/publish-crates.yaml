@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   publish:
+    # Fork-only fleet releases must never publish the manifest version to crates.io.
+    if: ${{ !startsWith(github.event.release.tag_name, 'fleet-') }}
     name: Publish crates.io packages
     runs-on: ubuntu-latest
     # Every published GitHub Release publishes to crates.io, release-candidates

@@ -56,6 +56,9 @@ jobs:
   # workflow_dispatch the inputs do (with "latest"/"auto" resolution).
   # ---------------------------------------------------------------------------
   resolve:
+    # Fleet-only releases are internal deployment artifacts, not public Kache
+    # releases. Never fan them out to apt/brew/winget/scoop/choco/AUR.
+    if: ${{ github.event_name != 'release' || !startsWith(github.event.release.tag_name, 'fleet-') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
