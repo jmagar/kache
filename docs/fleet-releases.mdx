@@ -5,8 +5,8 @@ description: Guarded internal release process for official upstream-based builds
 
 # Fleet releases
 
-This repository is a fork used to build the Kache binaries deployed on Dookie
-and the Tootie runner farm. Fleet releases are deployment artifacts. They are
+This repository is a fork used to build the Kache binaries deployed on Devhost
+and the Nashost runner farm. Fleet releases are deployment artifacts. They are
 separate from official `kunobi-ninja/kache` releases and must never publish
 crates or public OS packages.
 
@@ -127,7 +127,7 @@ Its GitHub release title, notes, and prerelease flag identify it clearly as an
 unreleased-upstream fleet snapshot. No deployed bytes were changed by the
 metadata correction.
 
-Dookie and the runner farm should continue using those bytes until an intentional
+Devhost and the runner farm should continue using those bytes until an intentional
 replacement passes the complete rollout gate.
 
 ## When upstream publishes the matching release
@@ -169,7 +169,7 @@ When upstream `v0.13.0` appears:
    fleet-v0.13.0.1
    ```
 
-6. Deploy Dookie first, then promote a checksum-pinned runner image through the
+6. Deploy Devhost first, then promote a checksum-pinned runner image through the
    drain-aware reconciler.
 
 7. Retain the current snapshot image and binary as rollback until the
@@ -179,7 +179,7 @@ When upstream `v0.13.0` appears:
 
 Every fleet deployment must preserve these invariants:
 
-- Dookie and all runners use identical binary bytes;
+- Devhost and all runners use identical binary bytes;
 - `prefetch_enabled = false` on persistent hosts;
 - exact remote lookups and uploads remain enabled;
 - the old image and binary remain available as rollback;
